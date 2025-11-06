@@ -1,0 +1,48 @@
+# FastAPI + Redis + Celery + Supabase Boilerplate Rules
+
+## Architecture Principles
+- Layered architecture: Routes → Services → Database/Cache
+- Services handle business logic and caching strategy
+- Tasks handle async/background operations
+- Always use async/await for I/O operations
+
+## Caching Strategy
+- Cache frequently accessed data (user profiles, posts)
+- Use cache_service.py for all caching operations
+- Cache key format: "{entity}:{id}"
+- Default TTL: 1 hour
+- Always have fallback to database
+
+## Background Tasks
+- Use Celery for: emails, file processing, scheduled jobs
+- Keep tasks idempotent
+- Tasks go in tasks/ directory
+- Never block API responses with heavy operations
+
+## Code Style
+- Use Pydantic for all data validation
+- Type hints everywhere
+- Async functions for all I/O
+- Service functions return Pydantic models
+
+## Dependencies
+- FastAPI
+- Supabase (database + auth + storage)
+- Redis (caching + rate limiting)
+- Celery (background jobs)
+- Pydantic (validation)
+
+## Error Handling
+- Use custom exceptions from exceptions/
+- Cache errors should not break app
+- Task failures should be logged and retried
+
+## Performance
+- Batch database operations
+- Use Redis pipeline for multiple operations
+- Implement pagination for list endpoints
+- Rate limit expensive endpoints
+
+## Testing
+- Unit test services with mocked Redis/Supabase
+- Integration test with test instances
