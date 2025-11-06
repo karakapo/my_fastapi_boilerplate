@@ -1,0 +1,643 @@
+# API Routes & Endpoints
+
+## Route Yapısı
+
+### Temel Route Template
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from app.models.user import UserResponse, UserCreate, UserUpdate
+from app.models.common import SuccessResponse, PaginatedResponse
+from app.api.v1.deps import get_current_user, get_user_service
+from app.services.user_service import UserService
+from app.exceptions.base import UserNotFoundException
+
+router = APIRouter(prefix="/users", tags=["Users"])
+
+@router.get("/{user_id}", response_model=SuccessResponse)
+async def get_user(
+    user_id: str,
+    current_user: dict = Depends(get_current_user),
+    user_service: UserService = Depends(get_user_service)
+) -> SuccessResponse:
+    """
+    Get user by ID.
+
+    - **user_id**: User ID to fetch
+    - Returns: User data with caching
+    - Raises: 404 if user not found
+    """
+    try:
+        user = await user_service.get_user_by_id(user_id)
+        return SuccessResponse(data=user.model_dump())
+
+    except UserNotFoundException as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=e.message
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get user: {str(e)}"
+        )
+```
+
+---
+
+## HTTP Methods & Status Codes
+
+### GET - Read
+```python
+# Single resource
+@router.get("/{resource_id}", response_model=SuccessResponse)
+async def get_resource(resource_id: str):
+    # Return 200 OK
+    return SuccessResponse(data=resource)
+
+# List resources
+@router.get("", response_model=PaginatedResponse)
+async def list_resources(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100)
+):
+    # Return 200 OK
+    return PaginatedResponse(data=resources, page=page, ...)
+```
+
+**Status Codes:**
+- `200 OK` - Success
+- `404 NOT FOUND` - Resource not found
+
+---
+
+### POST - Create
+```python
+@router.post("", response_model=SuccessResponse, status_code=status.HTTP_201_CREATED)
+async def create_resource(
+    resource_data: ResourceCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    resource = await service.create_resource(resource_data)
+    # Return 201 CREATED
+    return SuccessResponse(data=resource.model_dump())
+```
+
+**Status Codes:**
+- `201 CREATED` - Resource created
+- `400 BAD REQUEST` - Invalid input
+- `409 CONFLICT` - Resource already exists
+- `422 UNPROCESSABLE ENTITY` - Validation error
+
+---
+
+### PUT - Full Update
+```python
+@router.put("/{resource_id}", response_model=SuccessResponse)
+async def update_resource(
+    resource_id: str,
+    resource_data: ResourceUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    resource = await service.update_resource(resource_id, resource_data)
+    # Return 200 OK
+    return SuccessResponse(data=resource.model_dump())
+```
+
+**Status Codes:**
+- `200 OK` - Updated successfully
+- `404 NOT FOUND` - Resource not found
+- `422 UNPROCESSABLE ENTITY` - Validation error
+
+---
+
+### PATCH - Partial Update
+```python
+@router.patch("/{resource_id}", response_model=SuccessResponse)
+async def partial_update_resource(
+    resource_id: str,
+    resource_data: ResourcePartialUpdate,  # All fields optional
+    current_user: dict = Depends(get_current_user)
+):
+    resource = await service.partial_update_resource(resource_id, resource_data)
+    return SuccessResponse(data=resource.model_dump())
+```
+
+---
+
+### DELETE - Delete
+```python
+@router.delete("/{resource_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_resource(
+    resource_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    await service.delete_resource(resource_id)
+    # Return 204 NO CONTENT (no body)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+```
+
+**Status Codes:**
+- `204 NO CONTENT` - Deleted successfully
+- `404 NOT FOUND` - Resource not found
+
+---
+
+## Query Parameters
+
+### Pagination
+```python
+@router.get("/posts", response_model=PaginatedResponse)
+async def list_posts(
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page")
+):
+    offset = (page - 1) * page_size
+    posts = await service.list_posts(offset=offset, limit=page_size)
+
+    return PaginatedResponse(
+        data=posts,
+        page=page,
+        page_size=page_size,
+        total=total_count,
+        has_next=page * page_size < total_count
+    )
+```
+
+### Filtering
+```python
+@router.get("/posts", response_model=PaginatedResponse)
+async def list_posts(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    # Filters
+    published: bool = Query(None),
+    author_id: str = Query(None),
+    tag: list[str] = Query(None),
+    # Sorting
+    sort_by: str = Query("created_at", regex="^(created_at|title|views)$"),
+    order: str = Query("desc", regex="^(asc|desc)$")
+):
+    posts = await service.list_posts(
+        page=page,
+        page_size=page_size,
+        filters={
+            "published": published,
+            "author_id": author_id,
+            "tags": tag
+        },
+        sort_by=sort_by,
+        order=order
+    )
+
+    return PaginatedResponse(data=posts, ...)
+```
+
+### Search
+```python
+@router.get("/posts/search", response_model=PaginatedResponse)
+async def search_posts(
+    q: str = Query(..., min_length=3, description="Search query"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100)
+):
+    results = await service.search_posts(query=q, page=page, page_size=page_size)
+    return PaginatedResponse(data=results, ...)
+```
+
+---
+
+## Request Body Validation
+
+### Pydantic Models
+
+```python
+from pydantic import BaseModel, EmailStr, Field, validator
+
+class UserCreate(BaseModel):
+    email: EmailStr  # Email validation
+    password: str = Field(..., min_length=8, max_length=100)
+    name: str = Field(..., min_length=2, max_length=100)
+    age: int = Field(..., ge=18, le=120)
+
+    @validator('password')
+    def password_strength(cls, v):
+        if not any(c.isupper() for c in v):
+            raise ValueError('Password must contain uppercase letter')
+        if not any(c.isdigit() for c in v):
+            raise ValueError('Password must contain digit')
+        return v
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "email": "user@example.com",
+                "password": "SecurePass123",
+                "name": "John Doe",
+                "age": 25
+            }
+        }
+    }
+```
+
+### Route ile Kullanım
+```python
+@router.post("/users", response_model=SuccessResponse, status_code=201)
+async def create_user(
+    user_data: UserCreate,  # Otomatik validation
+    user_service: UserService = Depends(get_user_service)
+):
+    user = await user_service.create_user(user_data)
+    return SuccessResponse(data=user.model_dump())
+```
+
+---
+
+## Response Models
+
+### Success Response
+```python
+class SuccessResponse(BaseModel):
+    success: bool = True
+    data: Any
+
+# Kullanım
+@router.get("/users/{user_id}", response_model=SuccessResponse)
+async def get_user(user_id: str):
+    user = await service.get_user(user_id)
+    return SuccessResponse(data=user.model_dump())
+```
+
+### Error Response
+```python
+# Otomatik olarak middleware tarafından döndürülür
+{
+    "success": false,
+    "error": {
+        "code": "USER_NOT_FOUND",
+        "message": "User with ID 123 not found",
+        "details": {"user_id": "123"}
+    }
+}
+```
+
+### Paginated Response
+```python
+class PaginatedResponse(BaseModel):
+    success: bool = True
+    data: list
+    page: int
+    page_size: int
+    total: Optional[int] = None
+    has_next: bool = False
+
+# Kullanım
+@router.get("/posts", response_model=PaginatedResponse)
+async def list_posts(page: int = 1, page_size: int = 20):
+    posts, total = await service.list_posts(page, page_size)
+
+    return PaginatedResponse(
+        data=posts,
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_next=page * page_size < total
+    )
+```
+
+---
+
+## Authentication & Authorization
+
+### Protected Endpoint
+```python
+from app.api.v1.deps import get_current_user
+
+@router.get("/me", response_model=SuccessResponse)
+async def get_current_user_info(
+    current_user: dict = Depends(get_current_user)
+):
+    # current_user otomatik olarak token'dan parse edilir
+    return SuccessResponse(data=current_user)
+```
+
+### Optional Authentication
+```python
+from app.core.security import get_optional_user
+
+@router.get("/posts/{post_id}", response_model=SuccessResponse)
+async def get_post(
+    post_id: str,
+    current_user: Optional[dict] = Depends(get_optional_user)
+):
+    # Public endpoint ama authenticated user varsa extra data döndür
+    post = await service.get_post(post_id)
+
+    if current_user:
+        # Include user-specific data (is_liked, is_bookmarked, etc.)
+        post["is_liked"] = await service.is_liked_by_user(post_id, current_user["id"])
+
+    return SuccessResponse(data=post)
+```
+
+### Permission Check
+```python
+@router.put("/posts/{post_id}", response_model=SuccessResponse)
+async def update_post(
+    post_id: str,
+    post_data: PostUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    # Check permission
+    post = await service.get_post(post_id)
+
+    if post.author_id != current_user["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only update your own posts"
+        )
+
+    updated_post = await service.update_post(post_id, post_data)
+    return SuccessResponse(data=updated_post.model_dump())
+```
+
+---
+
+## Error Handling
+
+### Custom Exceptions
+```python
+from app.exceptions.base import UserNotFoundException, ValidationException
+
+@router.get("/users/{user_id}")
+async def get_user(user_id: str):
+    try:
+        user = await service.get_user(user_id)
+        return SuccessResponse(data=user.model_dump())
+
+    except UserNotFoundException as e:
+        # Custom exception - middleware handles it
+        raise HTTPException(status_code=404, detail=e.message)
+
+    except ValidationException as e:
+        raise HTTPException(status_code=422, detail=e.message)
+
+    except Exception as e:
+        # Unexpected error
+        logger.exception("Unexpected error in get_user")
+        raise HTTPException(status_code=500, detail="Internal server error")
+```
+
+### Validation Errors
+```python
+# Pydantic otomatik validation yapar
+@router.post("/users")
+async def create_user(user_data: UserCreate):
+    # user_data.email invalid ise otomatik 422 döner
+    pass
+```
+
+**Validation Error Response:**
+```json
+{
+    "success": false,
+    "error": {
+        "code": "VALIDATION_ERROR",
+        "message": "Request validation failed",
+        "details": [
+            {
+                "loc": ["body", "email"],
+                "msg": "value is not a valid email address",
+                "type": "value_error.email"
+            }
+        ]
+    }
+}
+```
+
+---
+
+## Background Tasks
+
+### Fire and Forget
+```python
+from app.tasks.email_tasks import send_welcome_email
+
+@router.post("/signup", response_model=SuccessResponse, status_code=201)
+async def signup(user_data: UserCreate):
+    # Create user
+    user = await service.create_user(user_data)
+
+    # Send welcome email in background
+    send_welcome_email.delay(user.email, user.name)
+
+    return SuccessResponse(
+        data={
+            "user": user.model_dump(),
+            "message": "User created. Welcome email will be sent."
+        }
+    )
+```
+
+### Return Task ID
+```python
+@router.post("/posts/{post_id}/process", response_model=SuccessResponse)
+async def process_post(
+    post_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    # Queue background task
+    result = process_post_data.delay(post_id)
+
+    return SuccessResponse(
+        data={
+            "task_id": result.id,
+            "status": "processing",
+            "message": "Processing started. Check /tasks/{task_id} for status."
+        }
+    )
+```
+
+---
+
+## File Upload
+
+```python
+from fastapi import File, UploadFile
+
+@router.post("/upload", response_model=SuccessResponse)
+async def upload_file(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+    # Validate file type
+    if file.content_type not in ["image/jpeg", "image/png"]:
+        raise HTTPException(400, "Invalid file type")
+
+    # Validate file size (max 5MB)
+    contents = await file.read()
+    if len(contents) > 5 * 1024 * 1024:
+        raise HTTPException(400, "File too large")
+
+    # Save file
+    file_path = await storage_service.save_file(file.filename, contents)
+
+    return SuccessResponse(
+        data={
+            "filename": file.filename,
+            "path": file_path,
+            "size": len(contents)
+        }
+    )
+```
+
+---
+
+## Versioning
+
+### URL Path Versioning (Önerilen)
+```python
+# app/api/v1/routes/users.py
+router = APIRouter(prefix="/users", tags=["Users"])
+
+# main.py
+app.include_router(users.router, prefix="/api/v1")
+
+# URL: /api/v1/users
+```
+
+### Header Versioning
+```python
+from fastapi import Header
+
+@router.get("/users")
+async def get_users(
+    api_version: str = Header(default="v1", alias="X-API-Version")
+):
+    if api_version == "v1":
+        # v1 logic
+        pass
+    elif api_version == "v2":
+        # v2 logic
+        pass
+```
+
+---
+
+## OpenAPI Documentation
+
+### Endpoint Documentation
+```python
+@router.post(
+    "/users",
+    response_model=SuccessResponse,
+    status_code=201,
+    summary="Create new user",
+    description="Register a new user account with email and password.",
+    response_description="Created user data",
+    tags=["Users"],
+    responses={
+        201: {"description": "User created successfully"},
+        400: {"description": "Invalid input"},
+        409: {"description": "Email already exists"}
+    }
+)
+async def create_user(user_data: UserCreate):
+    """
+    Create a new user account.
+
+    - **email**: Valid email address
+    - **password**: Min 8 characters, must contain uppercase and digit
+    - **name**: User's full name
+    """
+    pass
+```
+
+### Model Examples
+```python
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=8)
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "email": "user@example.com",
+                    "password": "SecurePass123"
+                }
+            ]
+        }
+    }
+```
+
+---
+
+## Best Practices
+
+### 1. Her Endpoint Response Model Belirt
+```python
+# ✅ DOĞRU
+@router.get("/users", response_model=SuccessResponse)
+async def list_users():
+    return SuccessResponse(data=users)
+
+# ❌ YANLIŞ - response_model yok
+@router.get("/users")
+async def list_users():
+    return {"data": users}
+```
+
+### 2. Status Code Belirt
+```python
+# ✅ DOĞRU
+@router.post("/users", status_code=status.HTTP_201_CREATED)
+
+# ❌ YANLIŞ - default 200 kullanır
+@router.post("/users")
+```
+
+### 3. Dependency Injection Kullan
+```python
+# ✅ DOĞRU
+@router.get("/users/{user_id}")
+async def get_user(
+    user_id: str,
+    user_service: UserService = Depends(get_user_service)
+):
+    return await user_service.get_user(user_id)
+
+# ❌ YANLIŞ - direct instantiation
+@router.get("/users/{user_id}")
+async def get_user(user_id: str):
+    user_service = UserService(supabase, cache)  # Hard to test
+    return await user_service.get_user(user_id)
+```
+
+### 4. Async Kullan
+```python
+# ✅ DOĞRU - async function
+@router.get("/users")
+async def list_users():
+    users = await service.get_users()
+    return users
+
+# ❌ YANLIŞ - sync function (I/O bound işlemler için)
+@router.get("/users")
+def list_users():
+    users = service.get_users()  # sync call
+    return users
+```
+
+### 5. Pagination Her Zaman
+```python
+# ✅ DOĞRU - paginated
+@router.get("/posts")
+async def list_posts(page: int = 1, page_size: int = 20):
+    return await service.list_posts(page, page_size)
+
+# ❌ YANLIŞ - tüm data dönüyor
+@router.get("/posts")
+async def list_posts():
+    return await service.list_all_posts()  # Memory problem!
+```

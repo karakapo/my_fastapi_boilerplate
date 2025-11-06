@@ -1,0 +1,410 @@
+# Caching Stratejisi
+
+## Cache Patterns
+
+### 1. Cache-Aside (Lazy Loading)
+
+En yaygın kullanılan pattern. Önce cache'e bak, yoksa DB'den al ve cache'le.
+
+```python
+async def get_user(user_id: str) -> UserResponse:
+    # 1. Cache check
+    cache_key = f"user:{user_id}"
+    cached_data = await cache.get(cache_key)
+
+    if cached_data:
+        return UserResponse(**cached_data)
+
+    # 2. Cache miss - Query database
+    user = await db.get_user(user_id)
+
+    if not user:
+        raise UserNotFoundException(user_id)
+
+    # 3. Cache the result
+    await cache.set(cache_key, user.dict(), ttl=3600)
+
+    return user
+```
+
+**Ne Zaman Kullan:**
+- Read-heavy operasyonlar
+- User profilleri
+- Product details
+- Settings
+
+---
+
+### 2. Write-Through
+
+Write işleminde hem DB'yi hem cache'i güncelle.
+
+```python
+async def update_user(user_id: str, data: UserUpdate) -> UserResponse:
+    # 1. Update database
+    updated_user = await db.update_user(user_id, data)
+
+    # 2. Update cache
+    cache_key = f"user:{user_id}"
+    await cache.set(cache_key, updated_user.dict(), ttl=3600)
+
+    return updated_user
+```
+
+**Ne Zaman Kullan:**
+- Consistency önemli olduğunda
+- Write frequency düşük olduğunda
+
+---
+
+### 3. Cache Invalidation
+
+Write işleminde sadece cache'i sil, read'de yeniden cache'le.
+
+```python
+async def update_user(user_id: str, data: UserUpdate) -> UserResponse:
+    # 1. Update database
+    await db.update_user(user_id, data)
+
+    # 2. Invalidate cache
+    await cache.delete(f"user:{user_id}")
+
+    # 3. Invalidate related caches
+    await cache.invalidate_pattern(f"user:{user_id}:*")
+
+    # 4. Return fresh data (will be cached on next read)
+    return await get_user(user_id)
+```
+
+**Ne Zaman Kullan:**
+- Related data varsa
+- Consistency kritik
+- Multiple cache entries etkileniyorsa
+
+---
+
+## Cache Key Naming Convention
+
+### Format
+```
+{entity}:{id}
+{entity}:{id}:{sub_entity}
+{entity}:{field}:{value}
+```
+
+### Örnekler
+```python
+# User
+"user:123"                          # User by ID
+"user:email:john@example.com"       # User by email
+"user:123:posts"                    # User's posts
+"user:123:profile"                  # User profile
+
+# Posts
+"post:456"                          # Post by ID
+"posts:page:1:size:20"              # Paginated posts
+"posts:published:page:1"            # Published posts (page 1)
+"posts:author:123:page:1"           # Author's posts (page 1)
+
+# Lists
+"posts:latest:10"                   # Latest 10 posts
+"users:active:page:1"               # Active users (page 1)
+```
+
+### Naming Rules
+1. **Lowercase kullan**: `user:123` ✅ `User:123` ❌
+2. **Snake_case tercih et**: `user_profile:123` ✅ `userProfile:123` ❌
+3. **Tutarlı ol**: Hep aynı formatı kullan
+4. **Descriptive ol**: `u:123` ❌ `user:123` ✅
+
+---
+
+## TTL (Time To Live) Kuralları
+
+### TTL Tablosu
+
+| Entity Type | TTL | Sebep | Cache Key Örneği |
+|------------|-----|-------|------------------|
+| User data | 3600s (1h) | Nadiren değişir | `user:123` |
+| User profile | 7200s (2h) | Çok nadiren değişir | `user:123:profile` |
+| Posts list | 1800s (30m) | Sık güncellenir | `posts:page:1` |
+| Single post | 1800s (30m) | Orta sıklıkta | `post:456` |
+| Settings | 86400s (24h) | Çok nadiren değişir | `settings:global` |
+| Session data | 3600s (1h) | Güvenlik için kısa | `session:abc123` |
+| Rate limit | 60s (1m) | Rate limit window | `rate_limit:127.0.0.1` |
+
+### TTL Belirleme Kuralları
+
+1. **Değişim Sıklığı**: Sık değişirse kısa TTL
+2. **Kritiklik**: Kritik data ise kısa TTL
+3. **Memory Kullanımı**: Büyük data ise kısa TTL
+4. **Business Logic**: İş gereksinimlerine göre
+
+### Dynamic TTL
+```python
+def get_ttl_for_entity(entity_type: str) -> int:
+    ttl_map = {
+        "user": 3600,
+        "post": 1800,
+        "settings": 86400,
+    }
+    return ttl_map.get(entity_type, 3600)  # Default 1 hour
+
+# Kullanım
+await cache.set(
+    f"user:{user_id}",
+    user_data,
+    ttl=get_ttl_for_entity("user")
+)
+```
+
+---
+
+## Cache Service Best Practices
+
+### 1. Her Zaman DB Fallback
+
+```python
+# ❌ YANLIŞ - Cache hatası uygulamayı kırar
+async def get_user(user_id: str):
+    cached = await cache.get(f"user:{user_id}")
+    if cached:
+        return cached
+    # Cache yoksa ne olacak?
+
+# ✅ DOĞRU - Her zaman fallback
+async def get_user(user_id: str):
+    try:
+        cached = await cache.get(f"user:{user_id}")
+        if cached:
+            return UserResponse(**cached)
+    except Exception as e:
+        logger.warning(f"Cache error: {e}")
+
+    # Fallback to database
+    user = await db.get_user(user_id)
+
+    # Try to cache (don't break if fails)
+    try:
+        await cache.set(f"user:{user_id}", user.dict(), ttl=3600)
+    except Exception as e:
+        logger.warning(f"Failed to cache user: {e}")
+
+    return user
+```
+
+### 2. Sensitive Data Cache'leme
+
+```python
+# ❌ YANLIŞ - Sensitive data cache'lenir
+await cache.set("user:123:password", password_hash)
+await cache.set("user:123:credit_card", credit_card)
+
+# ✅ DOĞRU - Sensitive data cache'lenmez
+user_data = {
+    "id": user.id,
+    "email": user.email,
+    # password, tokens cache'lenmez
+}
+await cache.set("user:123", user_data)
+```
+
+### 3. Pattern-based Invalidation
+
+```python
+# Kullanıcı update edildiğinde tüm related cache'leri temizle
+async def update_user(user_id: str, data: UserUpdate):
+    await db.update_user(user_id, data)
+
+    # User cache'i sil
+    await cache.delete(f"user:{user_id}")
+
+    # Related cache'leri sil
+    await cache.invalidate_pattern(f"user:{user_id}:*")
+    # Bu şunları siler:
+    # - user:123:posts
+    # - user:123:profile
+    # - user:123:settings
+```
+
+### 4. Redis Pipeline Kullan
+
+Birden fazla cache operasyonu için pipeline kullan:
+
+```python
+# ❌ YANLIŞ - Her operasyon ayrı network call
+for post_id in post_ids:
+    await cache.set(f"post:{post_id}", posts[post_id])
+
+# ✅ DOĞRU - Batch operation
+pipe = redis_client.pipeline()
+for post_id, post_data in posts.items():
+    pipe.setex(f"post:{post_id}", 1800, json.dumps(post_data))
+await pipe.execute()
+```
+
+---
+
+## Cache Monitoring
+
+### Metrics to Track
+
+1. **Cache Hit Rate**
+   - Target: >80%
+   - Formula: `hits / (hits + misses) * 100`
+
+2. **Cache Memory Usage**
+   - Target: <80% of max memory
+   - Monitor: `INFO memory` in Redis
+
+3. **Average TTL**
+   - Ensure keys are expiring properly
+
+4. **Eviction Rate**
+   - High eviction = need more memory or shorter TTL
+
+### Monitoring Code
+```python
+async def get_cache_stats():
+    info = await redis_client.info("stats")
+
+    hits = info.get("keyspace_hits", 0)
+    misses = info.get("keyspace_misses", 0)
+    total = hits + misses
+
+    hit_rate = (hits / total * 100) if total > 0 else 0
+
+    return {
+        "hit_rate": hit_rate,
+        "hits": hits,
+        "misses": misses,
+        "evicted_keys": info.get("evicted_keys", 0)
+    }
+```
+
+---
+
+## Common Caching Pitfalls
+
+### 1. Cache Stampede
+**Problem:** Cache expire olduğunda çok sayıda request aynı anda DB'ye gider.
+
+**Solution:** Lock mekanizması
+```python
+import asyncio
+
+async def get_with_lock(key: str, fetch_fn):
+    # Try cache first
+    cached = await cache.get(key)
+    if cached:
+        return cached
+
+    # Acquire lock
+    lock_key = f"lock:{key}"
+    lock = await cache.set(lock_key, "1", ttl=10, nx=True)
+
+    if lock:
+        # We got the lock, fetch from DB
+        data = await fetch_fn()
+        await cache.set(key, data, ttl=3600)
+        await cache.delete(lock_key)
+        return data
+    else:
+        # Wait for lock holder to finish
+        await asyncio.sleep(0.1)
+        return await get_with_lock(key, fetch_fn)
+```
+
+### 2. Stale Data
+**Problem:** Cache'deki data DB ile sync değil.
+
+**Solution:** Aggressive invalidation
+```python
+# Her update'te related cache'leri sil
+async def update_post(post_id: str, data: PostUpdate):
+    await db.update_post(post_id, data)
+
+    # Invalidate all related caches
+    await cache.delete(f"post:{post_id}")
+    await cache.invalidate_pattern(f"posts:*")  # List caches
+    await cache.invalidate_pattern(f"user:{author_id}:posts*")
+```
+
+### 3. Large Objects in Cache
+**Problem:** Çok büyük objeler memory doldurur.
+
+**Solution:** Partial caching veya compression
+```python
+# Sadece gerekli field'ları cache'le
+user_cache_data = {
+    "id": user.id,
+    "email": user.email,
+    "name": user.name
+    # Large fields (bio, preferences) cache'lenmesin
+}
+await cache.set(f"user:{user.id}:basic", user_cache_data)
+```
+
+---
+
+## Cache Implementation Examples
+
+### User Service with Caching
+```python
+class UserService:
+    def __init__(self, db, cache: CacheService):
+        self.db = db
+        self.cache = cache
+
+    async def get_user(self, user_id: str) -> User:
+        cache_key = f"user:{user_id}"
+
+        # Try cache
+        cached = await self.cache.get(cache_key)
+        if cached:
+            return User(**cached)
+
+        # Query DB
+        user = await self.db.get_user(user_id)
+        if not user:
+            raise UserNotFoundException(user_id)
+
+        # Cache it
+        await self.cache.set(cache_key, user.dict(), ttl=3600)
+        return user
+
+    async def update_user(self, user_id: str, data: UserUpdate) -> User:
+        # Update DB
+        user = await self.db.update_user(user_id, data)
+
+        # Invalidate cache
+        await self.cache.delete(f"user:{user_id}")
+
+        return user
+```
+
+### List with Pagination Caching
+```python
+async def list_posts(page: int, page_size: int) -> list[Post]:
+    cache_key = f"posts:page:{page}:size:{page_size}"
+
+    # Try cache
+    cached = await cache.get(cache_key)
+    if cached:
+        return [Post(**p) for p in cached]
+
+    # Query DB
+    posts = await db.list_posts(
+        offset=(page - 1) * page_size,
+        limit=page_size
+    )
+
+    # Cache for 30 minutes
+    await cache.set(
+        cache_key,
+        [p.dict() for p in posts],
+        ttl=1800
+    )
+
+    return posts
+```

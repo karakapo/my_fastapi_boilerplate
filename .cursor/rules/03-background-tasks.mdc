@@ -1,0 +1,525 @@
+# Background Tasks (Celery)
+
+## Task Yazma Prensipleri
+
+### 1. İdempotent Tasklar
+
+Task'ın birden fazla kez çalıştırılması aynı sonucu vermeli.
+
+```python
+# ❌ YANLIŞ - İdempotent değil
+@celery_app.task
+def process_order(order_id: str):
+    order = db.get_order(order_id)
+    order.process_count += 1  # 2 kez çalışırsa 2 kez artacak!
+    db.save(order)
+
+# ✅ DOĞRU - İdempotent
+@celery_app.task
+def process_order(order_id: str):
+    order = db.get_order(order_id)
+
+    # Daha önce işlenmişse skip et
+    if order.status == "processed":
+        logger.info(f"Order {order_id} already processed")
+        return {"status": "already_processed"}
+
+    # İşle
+    order.status = "processed"
+    order.processed_at = datetime.utcnow()
+    db.save(order)
+
+    return {"status": "success"}
+```
+
+**İdempotent Yapma Yöntemleri:**
+1. Status check (yukarıdaki gibi)
+2. Unique constraint kullan (DB level)
+3. Redis lock kullan
+4. Transaction ID kullan
+
+---
+
+### 2. Retry Logic
+
+Her task retry mekanizması içermeli.
+
+```python
+@celery_app.task(
+    bind=True,              # self parametresi için
+    max_retries=3,          # Max retry sayısı
+    default_retry_delay=60  # Retry arasında bekleme (saniye)
+)
+def send_email(self, user_email: str, subject: str, body: str):
+    try:
+        email_service.send(
+            to=user_email,
+            subject=subject,
+            body=body
+        )
+        logger.info(f"Email sent to {user_email}")
+        return {"status": "sent", "email": user_email}
+
+    except SMTPException as exc:
+        # Geçici hata - retry yap
+        logger.warning(f"Email sending failed, retrying: {exc}")
+        raise self.retry(exc=exc, countdown=60)
+
+    except Exception as exc:
+        # Kalıcı hata - retry yapma
+        logger.error(f"Email sending failed permanently: {exc}")
+        raise
+```
+
+**Retry Stratejileri:**
+
+```python
+# Exponential backoff
+@celery_app.task(bind=True, max_retries=5)
+def task_with_backoff(self, data):
+    try:
+        process(data)
+    except Exception as exc:
+        # 1min, 2min, 4min, 8min, 16min
+        countdown = 60 * (2 ** self.request.retries)
+        raise self.retry(exc=exc, countdown=countdown)
+
+# Custom retry logic
+@celery_app.task(bind=True)
+def task_with_custom_retry(self, data):
+    try:
+        process(data)
+    except TransientError as exc:
+        # Geçici hatalar için retry
+        raise self.retry(exc=exc, countdown=30)
+    except PermanentError:
+        # Kalıcı hatalar için retry yapma
+        raise
+```
+
+---
+
+### 3. Timeout Belirle
+
+Her task için timeout belirle.
+
+```python
+@celery_app.task(
+    time_limit=600,       # 10 dakika - hard limit (task kill edilir)
+    soft_time_limit=540   # 9 dakika - soft limit (SoftTimeLimitExceeded raise eder)
+)
+def heavy_processing(data_id: str):
+    try:
+        # Ağır işlem
+        result = process_large_dataset(data_id)
+        return result
+    except SoftTimeLimitExceeded:
+        # Graceful shutdown
+        logger.warning("Task soft time limit exceeded")
+        cleanup()
+        raise
+```
+
+**Timeout Best Practices:**
+- `soft_time_limit` < `time_limit` (cleanup için zaman bırak)
+- Default: `time_limit=30*60` (30 dakika)
+- I/O bound: Kısa timeout (5-10 dakika)
+- CPU bound: Uzun timeout (30-60 dakika)
+
+---
+
+### 4. Küçük Payload
+
+Task'a büyük objeler geçme, sadece ID geç.
+
+```python
+# ❌ YANLIŞ - Büyük payload
+@celery_app.task
+def process_user(user_data: dict):
+    # user_data çok büyük olabilir
+    # Serialization yavaş
+    # Redis/message broker memory kullanır
+    process(user_data)
+
+# ✅ DOĞRU - Sadece ID
+@celery_app.task
+def process_user(user_id: str):
+    # ID küçük, hızlı serialize
+    user = db.get_user(user_id)
+    process(user)
+
+# ✅ DOĞRU - Batch processing için ID listesi
+@celery_app.task
+def process_users(user_ids: list[str]):
+    for user_id in user_ids:
+        user = db.get_user(user_id)
+        process(user)
+```
+
+---
+
+## Task Patterns
+
+### 1. Email Task
+
+```python
+from app.core.celery_app import celery_app
+from app.services.email_service import EmailService
+import logging
+
+logger = logging.getLogger(__name__)
+
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    default_retry_delay=60,
+    name="tasks.send_welcome_email"
+)
+def send_welcome_email(self, user_email: str, user_name: str) -> dict:
+    """
+    Send welcome email to new user.
+
+    Idempotent: Email service should handle duplicate sends.
+    """
+    try:
+        logger.info(f"Sending welcome email to {user_email}")
+
+        email_service = EmailService()
+
+        import asyncio
+        success = asyncio.run(
+            email_service.send_welcome_email(user_email, user_name)
+        )
+
+        if not success:
+            raise Exception("Email service returned False")
+
+        return {
+            "status": "success",
+            "email": user_email,
+            "task_id": self.request.id
+        }
+
+    except Exception as exc:
+        logger.error(f"Failed to send welcome email: {exc}")
+        raise self.retry(exc=exc, countdown=60)
+```
+
+**Kullanım:**
+```python
+# Route'da
+from app.tasks.email_tasks import send_welcome_email
+
+@router.post("/signup")
+async def signup(user_data: UserCreate):
+    user = await create_user(user_data)
+
+    # Email'i background'da gönder
+    send_welcome_email.delay(user.email, user.name)
+
+    return {"message": "User created, welcome email will be sent"}
+```
+
+---
+
+### 2. Data Processing Task
+
+```python
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    time_limit=600,
+    name="tasks.process_user_data"
+)
+def process_user_data(self, user_id: str) -> dict:
+    """
+    Process user data in background.
+
+    Heavy computation that should not block API response.
+    """
+    try:
+        logger.info(f"Processing data for user {user_id}")
+
+        # 1. Fetch data
+        user = db.get_user(user_id)
+        user_activity = db.get_user_activity(user_id)
+
+        # 2. Heavy computation
+        analytics = calculate_user_analytics(user, user_activity)
+        recommendations = generate_recommendations(user, analytics)
+
+        # 3. Save results
+        db.save_analytics(user_id, analytics)
+        db.save_recommendations(user_id, recommendations)
+
+        # 4. Invalidate cache
+        cache.delete(f"user:{user_id}:analytics")
+
+        logger.info(f"Completed processing for user {user_id}")
+
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "analytics": analytics,
+            "recommendations_count": len(recommendations)
+        }
+
+    except Exception as exc:
+        logger.error(f"Failed to process user data: {exc}")
+        raise self.retry(exc=exc, countdown=120)
+```
+
+---
+
+### 3. Scheduled Task (Cleanup)
+
+```python
+@celery_app.task(name="tasks.cleanup_old_data")
+def cleanup_old_data() -> dict:
+    """
+    Cleanup old data from database.
+
+    Run daily via Celery Beat.
+    """
+    try:
+        logger.info("Starting cleanup task")
+
+        # Delete old logs (older than 30 days)
+        deleted_logs = db.delete_old_logs(days=30)
+
+        # Archive old records (older than 90 days)
+        archived_records = db.archive_old_records(days=90)
+
+        # Clear expired cache entries
+        cache.clear_expired()
+
+        logger.info(
+            f"Cleanup completed: {deleted_logs} logs deleted, "
+            f"{archived_records} records archived"
+        )
+
+        return {
+            "status": "success",
+            "deleted_logs": deleted_logs,
+            "archived_records": archived_records
+        }
+
+    except Exception as exc:
+        logger.error(f"Cleanup task failed: {exc}")
+        raise
+```
+
+**Celery Beat Configuration:**
+```python
+# app/core/celery_app.py
+from celery.schedules import crontab
+
+celery_app.conf.beat_schedule = {
+    'cleanup-daily': {
+        'task': 'tasks.cleanup_old_data',
+        'schedule': crontab(hour=2, minute=0),  # 2 AM every day
+    },
+    'generate-reports-weekly': {
+        'task': 'tasks.generate_weekly_reports',
+        'schedule': crontab(day_of_week=1, hour=9),  # Monday 9 AM
+    },
+}
+```
+
+---
+
+## Task Calling Methods
+
+### 1. Delay (Simple)
+```python
+# En basit kullanım
+send_email.delay(user_email, subject, body)
+
+# Eşdeğeri:
+send_email.apply_async(args=[user_email, subject, body])
+```
+
+### 2. Delayed Execution
+```python
+# 5 dakika sonra çalıştır
+send_email.apply_async(
+    args=[user_email, subject, body],
+    countdown=300
+)
+
+# Belirli bir zamanda çalıştır
+from datetime import datetime, timedelta
+eta = datetime.utcnow() + timedelta(hours=2)
+send_email.apply_async(
+    args=[user_email, subject, body],
+    eta=eta
+)
+```
+
+### 3. Priority
+```python
+# Yüksek öncelikli
+send_critical_email.apply_async(
+    args=[...],
+    priority=10  # 0-10, 10 en yüksek
+)
+
+# Düşük öncelikli
+send_newsletter.apply_async(
+    args=[...],
+    priority=1
+)
+```
+
+### 4. Task Chaining
+```python
+from celery import chain
+
+# Sıralı çalıştır: task1 → task2 → task3
+result = chain(
+    download_file.s(url),
+    process_file.s(),
+    upload_result.s()
+).apply_async()
+```
+
+### 5. Group (Parallel)
+```python
+from celery import group
+
+# Paralel çalıştır
+job = group([
+    process_item.s(item_id)
+    for item_id in item_ids
+])
+result = job.apply_async()
+
+# Tüm sonuçları bekle
+results = result.get()
+```
+
+### 6. Chord (Parallel + Callback)
+```python
+from celery import chord
+
+# Paralel çalıştır, hepsi bitince callback
+callback = send_summary_email.s()
+result = chord([
+    process_item.s(i) for i in items
+])(callback)
+```
+
+---
+
+## Task Monitoring
+
+### 1. Task State Check
+```python
+from celery.result import AsyncResult
+
+# Task'ı queue'ya at
+result = send_email.delay(email, subject, body)
+task_id = result.id
+
+# Durumu kontrol et
+task_result = AsyncResult(task_id, app=celery_app)
+
+print(task_result.state)  # PENDING, STARTED, SUCCESS, FAILURE
+print(task_result.result)  # Task return value
+print(task_result.traceback)  # Error traceback (if failed)
+```
+
+### 2. Task Status Endpoint
+```python
+# routes/tasks.py
+from celery.result import AsyncResult
+from app.core.celery_app import celery_app
+
+@router.get("/tasks/{task_id}")
+async def get_task_status(task_id: str):
+    task = AsyncResult(task_id, app=celery_app)
+
+    return {
+        "task_id": task_id,
+        "state": task.state,
+        "result": task.result if task.successful() else None,
+        "error": str(task.info) if task.failed() else None
+    }
+```
+
+### 3. Active Tasks
+```bash
+# CLI'dan
+celery -A app.core.celery_app:celery_app inspect active
+celery -A app.core.celery_app:celery_app inspect scheduled
+celery -A app.core.celery_app:celery_app inspect reserved
+```
+
+---
+
+## Error Handling
+
+### 1. Task Exception Handling
+```python
+@celery_app.task(bind=True, max_retries=3)
+def risky_task(self, data_id: str):
+    try:
+        result = risky_operation(data_id)
+        return {"status": "success", "result": result}
+
+    except TemporaryError as exc:
+        # Geçici hata - retry
+        logger.warning(f"Temporary error: {exc}")
+        raise self.retry(exc=exc, countdown=60)
+
+    except PermanentError as exc:
+        # Kalıcı hata - retry yapma, log et
+        logger.error(f"Permanent error: {exc}")
+        return {"status": "error", "error": str(exc)}
+
+    except Exception as exc:
+        # Beklenmeyen hata
+        logger.exception("Unexpected error in task")
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=exc, countdown=120)
+        else:
+            # Max retry'a ulaştık
+            return {"status": "failed", "error": str(exc)}
+```
+
+### 2. Task Failure Callback
+```python
+@celery_app.task
+def on_task_failure(self, exc, task_id, args, kwargs, einfo):
+    """Called when task fails after all retries."""
+    logger.error(
+        f"Task {task_id} failed permanently",
+        extra={
+            "exception": str(exc),
+            "args": args,
+            "kwargs": kwargs
+        }
+    )
+
+    # Send alert
+    send_admin_alert(f"Task {task_id} failed: {exc}")
+
+# Task'a bağla
+@celery_app.task(on_failure=on_task_failure)
+def important_task(data):
+    # ...
+    pass
+```
+
+---
+
+## Best Practices Summary
+
+1. ✅ **Her task idempotent olmalı**
+2. ✅ **Retry logic ekle** (max 3-5 retry)
+3. ✅ **Timeout belirle** (varsayılan 30 dakika)
+4. ✅ **Küçük payload** (ID geçir, obje değil)
+5. ✅ **Log her şeyi** (başlangıç, bitiş, hata)
+6. ✅ **Error handling** (geçici vs kalıcı hata)
+7. ✅ **Monitoring** (task state, queue length)
+8. ✅ **Test et** (unit test + integration test)

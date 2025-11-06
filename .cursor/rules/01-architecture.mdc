@@ -1,0 +1,357 @@
+# Mimari Prensipler
+
+## Katmanlı Mimari
+
+Bu proje 4 katmanlı mimari kullanır:
+
+### 1. Routes (API Layer) - `app/api/v1/routes/`
+**Sorumluluklar:**
+- HTTP isteklerini karşıla
+- Request validation (Pydantic ile)
+- Servis katmanını çağır
+- Response dönüş
+- Authentication/authorization check
+
+**Yapmaması Gerekenler:**
+- İş mantığı (business logic)
+- Doğrudan database sorguları
+- Caching mantığı
+
+**Örnek:**
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from app.api.v1.deps import get_user_service, get_current_user
+from app.models.user import UserResponse
+
+router = APIRouter(prefix="/users", tags=["Users"])
+
+@router.get("/me", response_model=SuccessResponse)
+async def get_current_user_info(
+    current_user: dict = Depends(get_current_user),
+    user_service: UserService = Depends(get_user_service)
+) -> SuccessResponse:
+    """Get current user information."""
+    user = await user_service.get_user_by_id(current_user["id"])
+    return SuccessResponse(data=user.model_dump())
+```
+
+---
+
+### 2. Services (Business Logic) - `app/services/`
+**Sorumluluklar:**
+- İş mantığı implementasyonu
+- Caching stratejisi
+- Database işlemleri
+- Service-to-service iletişim
+- Data transformation
+
+**Best Practices:**
+- Her servis bir domain'e odaklanmalı (user_service, post_service)
+- Return değeri her zaman Pydantic model olmalı
+- Cache-aside pattern uygula
+- Exception'ları düzgün handle et
+
+**Örnek:**
+```python
+class UserService:
+    def __init__(self, supabase: Client, cache: CacheService):
+        self.supabase = supabase
+        self.cache = cache
+
+    async def get_user_by_id(self, user_id: str) -> UserResponse:
+        # 1. Cache check
+        cache_key = f"user:{user_id}"
+        cached = await self.cache.get(cache_key)
+        if cached:
+            return UserResponse(**cached)
+
+        # 2. Database query
+        response = self.supabase.auth.admin.get_user_by_id(user_id)
+        if not response.user:
+            raise UserNotFoundException(user_id)
+
+        # 3. Transform & cache
+        user_data = {
+            "id": response.user.id,
+            "email": response.user.email,
+            "created_at": response.user.created_at
+        }
+        await self.cache.set(cache_key, user_data, ttl=3600)
+
+        return UserResponse(**user_data)
+```
+
+---
+
+### 3. Tasks (Background Jobs) - `app/tasks/`
+**Sorumluluklar:**
+- Async/background işlemler
+- Email gönderme
+- Veri işleme (data processing)
+- Scheduled jobs
+- Long-running operations
+
+**Best Practices:**
+- Her task idempotent olmalı
+- Retry logic ekle
+- Timeout belirle
+- Büyük objeler yerine ID geçir
+
+**Örnek:**
+```python
+from app.core.celery_app import celery_app
+
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    default_retry_delay=60
+)
+def send_welcome_email(self, user_email: str, user_name: str):
+    try:
+        email_service.send_welcome(user_email, user_name)
+    except Exception as exc:
+        raise self.retry(exc=exc, countdown=60)
+```
+
+---
+
+### 4. Core - `app/core/`
+**İçerik:**
+- `config.py` - Environment variables, settings
+- `redis.py` - Redis client & connection
+- `supabase.py` - Supabase client
+- `celery_app.py` - Celery configuration
+- `security.py` - JWT verification, authentication
+
+---
+
+## Dosya Organizasyonu
+
+```
+app/
+├── api/
+│   └── v1/
+│       ├── routes/
+│       │   ├── auth.py          # Authentication endpoints
+│       │   ├── users.py         # User CRUD
+│       │   ├── posts.py         # Post CRUD
+│       │   └── health.py        # Health checks
+│       └── deps.py              # Shared dependencies
+├── core/
+│   ├── config.py                # Settings (Pydantic BaseSettings)
+│   ├── redis.py                 # Redis client
+│   ├── supabase.py              # Supabase client
+│   ├── celery_app.py            # Celery app
+│   └── security.py              # JWT, auth
+├── services/
+│   ├── user_service.py          # User business logic
+│   ├── cache_service.py         # Caching operations
+│   └── email_service.py         # Email operations
+├── tasks/
+│   ├── email_tasks.py           # Email background jobs
+│   └── data_processing_tasks.py # Data processing jobs
+├── models/
+│   ├── user.py                  # User Pydantic models
+│   └── common.py                # Common response models
+├── exceptions/
+│   └── base.py                  # Custom exceptions
+├── middleware/
+│   ├── error_handler.py         # Global error handling
+│   └── rate_limiter.py          # Rate limiting
+└── main.py                      # FastAPI app entry point
+```
+
+---
+
+## Dependency Injection
+
+### 1. Dependencies Dosyası - `app/api/v1/deps.py`
+
+Tüm shared dependencies burada tanımlanır:
+
+```python
+from fastapi import Depends
+import redis.asyncio as redis
+from supabase import Client
+
+from app.core.redis import get_redis
+from app.core.supabase import get_supabase
+from app.core.security import get_current_user
+from app.services.cache_service import CacheService
+from app.services.user_service import UserService
+
+# Cache service dependency
+async def get_cache_service(
+    redis_client: redis.Redis = Depends(get_redis)
+) -> CacheService:
+    return CacheService(redis_client)
+
+# User service dependency
+async def get_user_service(
+    supabase: Client = Depends(get_supabase),
+    cache: CacheService = Depends(get_cache_service)
+) -> UserService:
+    return UserService(supabase, cache)
+```
+
+### 2. Route'larda Kullanım
+
+```python
+from app.api.v1.deps import get_user_service, get_current_user
+
+@router.get("/users/{user_id}")
+async def get_user(
+    user_id: str,
+    user_service: UserService = Depends(get_user_service),
+    current_user: dict = Depends(get_current_user)
+):
+    return await user_service.get_user_by_id(user_id)
+```
+
+### 3. Test'lerde Override
+
+```python
+# conftest.py
+@pytest.fixture
+def client(mock_redis, mock_supabase):
+    app.dependency_overrides[get_redis] = lambda: mock_redis
+    app.dependency_overrides[get_supabase] = lambda: mock_supabase
+
+    with TestClient(app) as client:
+        yield client
+
+    app.dependency_overrides.clear()
+```
+
+---
+
+## Data Flow
+
+### Read Operation (Cache-Aside)
+```
+1. Client Request
+   ↓
+2. Route Layer (validation)
+   ↓
+3. Service Layer
+   ↓
+4. Check Redis Cache
+   ├── Cache Hit → Return cached data
+   └── Cache Miss
+       ↓
+5. Query Supabase Database
+   ↓
+6. Cache Result
+   ↓
+7. Return Response
+```
+
+### Write Operation (Write-Through)
+```
+1. Client Request
+   ↓
+2. Route Layer (validation)
+   ↓
+3. Service Layer
+   ↓
+4. Update Supabase Database
+   ↓
+5. Invalidate Cache
+   ↓
+6. Return Response
+```
+
+### Background Job Flow
+```
+1. Client Request
+   ↓
+2. Route Layer
+   ↓
+3. Queue Celery Task (non-blocking)
+   ↓
+4. Return Response (immediately)
+
+(Parallel)
+5. Celery Worker picks up task
+   ↓
+6. Execute background job
+```
+
+---
+
+## Scalability Considerations
+
+### Stateless API
+- API'de session/state tutma
+- Tüm state Redis/Database'de
+- Horizontal scaling mümkün
+
+### Independent Scaling
+- API instances → Load balancer arkasında scale
+- Celery workers → Queue depth'e göre scale
+- Redis → Cluster moda geçirilebilir
+
+### Resource Separation
+- API: CPU-bound değil, I/O bound
+- Workers: CPU-bound işlemler burada
+- Redis: Memory-bound
+- Database: Supabase managed
+
+---
+
+## Anti-Patterns (Yapılmaması Gerekenler)
+
+### ❌ Route'da İş Mantığı
+```python
+# YANLIŞ
+@router.post("/users")
+async def create_user(user: UserCreate):
+    # İş mantığı route'da
+    existing = supabase.auth.get_user_by_email(user.email)
+    if existing:
+        raise HTTPException(400)
+
+    new_user = supabase.auth.sign_up(user.dict())
+    await cache.set(f"user:{new_user.id}", new_user.dict())
+    return new_user
+```
+
+```python
+# DOĞRU
+@router.post("/users")
+async def create_user(
+    user: UserCreate,
+    user_service: UserService = Depends(get_user_service)
+):
+    return await user_service.create_user(user)
+```
+
+### ❌ Service'de HTTP Response Nesneleri
+```python
+# YANLIŞ
+class UserService:
+    def get_user(self, user_id: str) -> JSONResponse:
+        return JSONResponse(content={...})
+
+# DOĞRU
+class UserService:
+    def get_user(self, user_id: str) -> UserResponse:
+        return UserResponse(...)
+```
+
+### ❌ Direct Database Access in Routes
+```python
+# YANLIŞ
+@router.get("/users/{user_id}")
+async def get_user(user_id: str, supabase: Client = Depends(get_supabase)):
+    user = supabase.auth.admin.get_user_by_id(user_id)
+    return user
+
+# DOĞRU
+@router.get("/users/{user_id}")
+async def get_user(
+    user_id: str,
+    user_service: UserService = Depends(get_user_service)
+):
+    return await user_service.get_user_by_id(user_id)
+```

@@ -1,0 +1,556 @@
+# Code Style & Conventions
+
+## Type Hints
+
+### Her Yerde Type Hint Kullan
+
+```python
+# ✅ DOĞRU - Type hints her yerde
+async def get_user(user_id: str) -> UserResponse:
+    user_data: dict = await db.query(user_id)
+    return UserResponse(**user_data)
+
+def calculate_total(items: list[dict]) -> float:
+    total: float = sum(item["price"] for item in items)
+    return total
+
+# ❌ YANLIŞ - Type hint yok
+async def get_user(user_id):
+    user_data = await db.query(user_id)
+    return UserResponse(**user_data)
+```
+
+### Complex Types
+```python
+from typing import Optional, Union, Dict, List, Any
+
+# Optional
+async def get_user(user_id: str) -> Optional[UserResponse]:
+    user = await db.get_user(user_id)
+    return user if user else None
+
+# Union
+def process_data(data: Union[str, int, dict]) -> str:
+    return str(data)
+
+# Dict with type hints
+def format_user(user: Dict[str, Any]) -> str:
+    return f"{user['name']} - {user['email']}"
+
+# List with type hints
+def get_user_ids(users: List[UserResponse]) -> List[str]:
+    return [user.id for user in users]
+```
+
+### Generics
+```python
+from typing import TypeVar, Generic
+
+T = TypeVar('T')
+
+class Repository(Generic[T]):
+    async def get(self, id: str) -> Optional[T]:
+        pass
+
+    async def list(self) -> List[T]:
+        pass
+
+# Kullanım
+user_repo: Repository[User] = Repository()
+user: Optional[User] = await user_repo.get("123")
+```
+
+---
+
+## Async/Await
+
+### I/O Bound = Async
+```python
+# ✅ DOĞRU - I/O operasyonları async
+async def get_user_data(user_id: str) -> dict:
+    # Database query (I/O)
+    user = await db.get_user(user_id)
+
+    # Cache operation (I/O)
+    await cache.set(f"user:{user_id}", user)
+
+    # API call (I/O)
+    profile = await external_api.get_profile(user_id)
+
+    return {"user": user, "profile": profile}
+
+# ❌ YANLIŞ - I/O operasyonları sync
+def get_user_data(user_id: str) -> dict:
+    user = db.get_user(user_id)  # Blocking!
+    cache.set(f"user:{user_id}", user)  # Blocking!
+    return user
+```
+
+### CPU Bound = Sync (Celery Task'a Taşı)
+```python
+# ✅ DOĞRU - CPU bound işlem Celery task'ta
+@celery_app.task
+def heavy_computation(data: list) -> dict:
+    # CPU-intensive operation
+    result = complex_calculation(data)
+    return result
+
+# Route'da
+@router.post("/compute")
+async def compute(data: list):
+    # Queue task, don't block
+    task = heavy_computation.delay(data)
+    return {"task_id": task.id}
+
+# ❌ YANLIŞ - CPU bound işlem endpoint'te
+@router.post("/compute")
+async def compute(data: list):
+    result = complex_calculation(data)  # Blocks event loop!
+    return result
+```
+
+### Await Kullanımı
+```python
+# ✅ DOĞRU
+async def get_users():
+    users = await db.list_users()
+    return users
+
+# ❌ YANLIŞ - await unutulmuş
+async def get_users():
+    users = db.list_users()  # Returns coroutine, not result!
+    return users
+```
+
+---
+
+## Logging
+
+### Structured Logging
+
+```python
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ✅ DOĞRU - Structured logging
+async def process_order(order_id: str):
+    logger.info(
+        f"Processing order {order_id}",
+        extra={
+            "order_id": order_id,
+            "user_id": user_id,
+            "action": "process_order"
+        }
+    )
+
+    try:
+        result = await process(order_id)
+        logger.info(f"Order {order_id} processed successfully")
+        return result
+
+    except Exception as e:
+        logger.error(
+            f"Failed to process order {order_id}",
+            extra={"order_id": order_id, "error": str(e)},
+            exc_info=True
+        )
+        raise
+
+# ❌ YANLIŞ - print kullanımı
+async def process_order(order_id: str):
+    print(f"Processing {order_id}")  # Don't use print!
+```
+
+### Log Levels
+```python
+# DEBUG - Detailed debugging info
+logger.debug(f"Cache key: user:{user_id}, TTL: {ttl}")
+
+# INFO - General information
+logger.info(f"User {user_id} logged in")
+
+# WARNING - Warning messages
+logger.warning(f"Cache miss for user:{user_id}, falling back to DB")
+
+# ERROR - Error messages
+logger.error(f"Failed to send email to {email}: {error}")
+
+# CRITICAL - Critical errors
+logger.critical(f"Database connection lost: {error}")
+```
+
+### Exception Logging
+```python
+# ✅ DOĞRU - Full exception logging
+try:
+    result = await risky_operation()
+except Exception as e:
+    logger.exception("Operation failed")  # Includes traceback
+    raise
+
+# ❌ YANLIŞ - Traceback eksik
+try:
+    result = await risky_operation()
+except Exception as e:
+    logger.error(f"Error: {e}")  # No traceback
+    raise
+```
+
+---
+
+## Pydantic Models
+
+### Model Definition
+```python
+from pydantic import BaseModel, EmailStr, Field, validator
+
+class UserCreate(BaseModel):
+    """User creation schema."""
+    email: EmailStr
+    password: str = Field(..., min_length=8, max_length=100)
+    name: str = Field(..., min_length=2, max_length=100)
+    age: int = Field(..., ge=18, le=120)
+
+    @validator('password')
+    def password_strength(cls, v: str) -> str:
+        if not any(c.isupper() for c in v):
+            raise ValueError('Password must contain uppercase')
+        if not any(c.isdigit() for c in v):
+            raise ValueError('Password must contain digit')
+        return v
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "email": "user@example.com",
+                "password": "SecurePass123",
+                "name": "John Doe",
+                "age": 25
+            }
+        }
+    }
+```
+
+### Model Inheritance
+```python
+class UserBase(BaseModel):
+    """Base user schema."""
+    email: EmailStr
+    name: str
+
+class UserCreate(UserBase):
+    """User creation schema."""
+    password: str = Field(..., min_length=8)
+
+class UserResponse(UserBase):
+    """User response schema."""
+    id: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+class UserUpdate(BaseModel):
+    """User update schema - all fields optional."""
+    email: Optional[EmailStr] = None
+    name: Optional[str] = None
+```
+
+---
+
+## Naming Conventions
+
+### Variables
+```python
+# ✅ DOĞRU - snake_case
+user_id = "123"
+user_email = "test@example.com"
+is_active = True
+max_retry_count = 3
+
+# ❌ YANLIŞ - camelCase, PascalCase
+userId = "123"  # JavaScript style
+UserEmail = "test@example.com"  # PascalCase
+```
+
+### Functions
+```python
+# ✅ DOĞRU - snake_case, verb-based
+async def get_user(user_id: str):
+    pass
+
+async def create_order(order_data: dict):
+    pass
+
+def calculate_total(items: list):
+    pass
+
+# ❌ YANLIŞ
+async def User(user_id: str):  # PascalCase
+    pass
+
+def total(items: list):  # Not descriptive
+    pass
+```
+
+### Classes
+```python
+# ✅ DOĞRU - PascalCase
+class UserService:
+    pass
+
+class CacheService:
+    pass
+
+# ❌ YANLIŞ - snake_case
+class user_service:
+    pass
+```
+
+### Constants
+```python
+# ✅ DOĞRU - UPPER_CASE
+MAX_RETRY_COUNT = 3
+DEFAULT_CACHE_TTL = 3600
+API_BASE_URL = "https://api.example.com"
+
+# ❌ YANLIŞ - lowercase
+max_retry_count = 3
+```
+
+### Private Methods
+```python
+class UserService:
+    def __init__(self):
+        pass
+
+    # Public method
+    async def get_user(self, user_id: str):
+        cache_key = self._get_cache_key(user_id)
+        return await self._fetch_user(user_id)
+
+    # Private method (convention)
+    def _get_cache_key(self, user_id: str) -> str:
+        return f"user:{user_id}"
+
+    # Private method
+    async def _fetch_user(self, user_id: str):
+        pass
+```
+
+---
+
+## File Organization
+
+### Imports Order
+```python
+# 1. Standard library
+import os
+import sys
+from datetime import datetime
+from typing import Optional, List
+
+# 2. Third-party
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+import redis
+
+# 3. Local application
+from app.core.config import get_settings
+from app.models.user import UserResponse
+from app.services.user_service import UserService
+```
+
+### Function Order in File
+```python
+# 1. Constants
+MAX_PAGE_SIZE = 100
+DEFAULT_PAGE = 1
+
+# 2. Type definitions
+UserDict = Dict[str, Any]
+
+# 3. Pydantic models
+class UserResponse(BaseModel):
+    pass
+
+# 4. Router
+router = APIRouter()
+
+# 5. Endpoints (CRUD order: Create, Read, Update, Delete)
+@router.post("")
+async def create_user():
+    pass
+
+@router.get("")
+async def list_users():
+    pass
+
+@router.get("/{user_id}")
+async def get_user():
+    pass
+
+@router.put("/{user_id}")
+async def update_user():
+    pass
+
+@router.delete("/{user_id}")
+async def delete_user():
+    pass
+```
+
+---
+
+## Error Handling
+
+### Custom Exceptions
+```python
+# ✅ DOĞRU - Custom exception with context
+from app.exceptions.base import UserNotFoundException
+
+async def get_user(user_id: str):
+    user = await db.get_user(user_id)
+
+    if not user:
+        raise UserNotFoundException(user_id)
+
+    return user
+
+# ❌ YANLIŞ - Generic exception
+async def get_user(user_id: str):
+    user = await db.get_user(user_id)
+
+    if not user:
+        raise Exception("User not found")  # Not descriptive
+
+    return user
+```
+
+### Exception Handling
+```python
+# ✅ DOĞRU - Specific exception handling
+try:
+    user = await db.get_user(user_id)
+except UserNotFoundException:
+    logger.warning(f"User {user_id} not found")
+    raise HTTPException(status_code=404, detail="User not found")
+except DatabaseError as e:
+    logger.error(f"Database error: {e}")
+    raise HTTPException(status_code=500, detail="Database error")
+except Exception as e:
+    logger.exception("Unexpected error")
+    raise HTTPException(status_code=500, detail="Internal server error")
+
+# ❌ YANLIŞ - Catch all
+try:
+    user = await db.get_user(user_id)
+except Exception as e:
+    print(f"Error: {e}")
+    return None
+```
+
+---
+
+## Documentation
+
+### Docstrings
+```python
+async def get_user_by_id(user_id: str) -> UserResponse:
+    """
+    Get user by ID with caching.
+
+    Args:
+        user_id: User ID to fetch
+
+    Returns:
+        User data
+
+    Raises:
+        UserNotFoundException: If user not found
+        DatabaseError: If database query fails
+
+    Example:
+        >>> user = await get_user_by_id("123")
+        >>> print(user.email)
+        'user@example.com'
+    """
+    pass
+```
+
+### Inline Comments
+```python
+# ✅ DOĞRU - Explain WHY, not WHAT
+async def process_order(order_id: str):
+    # Lock order to prevent double processing
+    async with lock_manager.lock(f"order:{order_id}"):
+        order = await db.get_order(order_id)
+
+        # Skip if already processed (idempotency)
+        if order.status == "processed":
+            return
+
+        await process(order)
+
+# ❌ YANLIŞ - Obvious comments
+async def process_order(order_id: str):
+    # Get order from database
+    order = await db.get_order(order_id)
+
+    # Process the order
+    await process(order)
+```
+
+---
+
+## Performance
+
+### List Comprehensions
+```python
+# ✅ DOĞRU - List comprehension
+user_ids = [user.id for user in users if user.is_active]
+
+# ❌ YANLIŞ - Loop
+user_ids = []
+for user in users:
+    if user.is_active:
+        user_ids.append(user.id)
+```
+
+### Use Built-ins
+```python
+# ✅ DOĞRU - Built-in functions
+total = sum(item.price for item in items)
+max_price = max(item.price for item in items)
+
+# ❌ YANLIŞ - Manual loop
+total = 0
+for item in items:
+    total += item.price
+```
+
+### Avoid Premature Optimization
+```python
+# ✅ DOĞRU - Readable first
+def calculate_discount(price: float, discount_percent: int) -> float:
+    discount_amount = price * (discount_percent / 100)
+    return price - discount_amount
+
+# ❌ YANLIŞ - Over-optimized, less readable
+def calculate_discount(p: float, d: int) -> float:
+    return p - p * d / 100  # Cryptic
+```
+
+---
+
+## Best Practices Summary
+
+1. ✅ **Type hints her yerde**
+2. ✅ **I/O operasyonları async**
+3. ✅ **Logger kullan, print kullanma**
+4. ✅ **Pydantic modelleri için validation**
+5. ✅ **snake_case için değişkenler/fonksiyonlar**
+6. ✅ **PascalCase için classlar**
+7. ✅ **Descriptive isimlendirme**
+8. ✅ **Docstring yaz**
+9. ✅ **Specific exception handling**
+10. ✅ **Code readable olmalı**
